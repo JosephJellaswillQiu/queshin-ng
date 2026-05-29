@@ -152,6 +152,30 @@ def get_kakan_combinations(hand, furo):
     return results
 
 
+KITA_TILE = 30  # 北
+
+
+def get_kita_combinations(hand, furo):
+    """Get all possible kita (拔北) combinations.
+
+    Args:
+        hand (list[num]): A list of tiles representing the hand.
+        furo (list[list[num]]): A list of melds.
+
+    Returns:
+        list[tuple[list[num], list[list[num]], str]]: A list of (hand, furo, "kita") tuples.
+    """
+    results = []
+    for tile in hand:
+        if tile == KITA_TILE:
+            new_hand = hand.copy()
+            new_hand.remove(tile)
+            new_furo = furo + [[tile]]
+            results.append((new_hand, new_furo, "kita"))
+
+    return results
+
+
 def get_possible_furo(hand, furo, card, allow_chi=True):
     """Get all possible meld combinations based on the hand and the last discarded tile.
 
