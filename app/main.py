@@ -253,16 +253,22 @@ async def action_discard(sid, data):
                 ron_players.append((other_sid, result))
 
     if ron_players:
-        # 有人能和 → 通知他们（实际应等待选择，这里简化为第一个荣和者）
-        winner_sid, result = ron_players[0]
-        await sio.emit('win_declared', {
-            'winner_sid': winner_sid,
-            'from_sid': sid,
+        # 广播 ron_prompt 给所有可荣和的玩家
+        room._ron_pending = {p_sid: result for p_sid, result in ron_players}
+        room._ron_from_tile = tile
+        room._ron_from_sid = sid
+        for target_sid, result in ron_players:
+            await sio.emit('ron_prompt', {
+                'tile': tile,
+                'from_seat': seat_idx,
+                'result': result,
+            }, room=target_sid)
+        # 通知其他人等待荣和响应
+        await sio.emit('waiting_ron', {
+            'from_seat': seat_idx,
             'tile': tile,
-            'result': result,
-        }, room=room_name)
-        room.is_playing = False
-        return
+        }, room=room_name, skip_sid=[p[0] for p in ron_players])
+        return  # 等待玩家响应 action_ron 或 action_pass
 
     # ── 检查其他玩家是否有副露选项 ──
     furo_prompts = {}
@@ -281,6 +287,8 @@ async def action_discard(sid, data):
             ]
 
     if furo_prompts:
+        # 设置副露 pending 追踪
+        room._furo_pending = dict(furo_prompts)
         # 广播副露提示给有选项的玩家
         for target_sid, opts in furo_prompts.items():
             await sio.emit('furo_prompt', {
@@ -292,11 +300,11 @@ async def action_discard(sid, data):
         await sio.emit('waiting_furo', {
             'from_seat': seat_idx,
             'tile': tile,
-        }, room=room_name, skip_sid=list(furo_prompts.keys())[0] if len(furo_prompts) == 1 else None)
+        }, room=room_name, skip_sid=list(furo_prompts.keys()))
+        return
 
     # ── 如果没有副露选项，轮到下家摸牌 ──
-    if not furo_prompts:
-        await _next_player_draw(room, room_name, sid)
+    await _next_player_draw(room, room_name, sid)
 
 
 @sio.event
@@ -417,16 +425,161 @@ async def action_ankan(sid, data):
 
 @sio.event
 async def action_pass(sid, data):
-    """跳过鸣牌"""
+    """跳过鸣牌/荣和"""
     room_name = data.get('room_name')
     room = room_manager.get_room(room_name)
     if not room:
         return
 
-    # 轮到下家摸牌
-    # 找到最后一个出牌的玩家
+    # 检查是否在等待荣和响应
+    if hasattr(room, '_ron_pending') and sid in room._ron_pending:
+        del room._ron_pending[sid]
+        if not room._ron_pending:
+            # 所有人都pass → 清理荣和状态 → 继续副露检查
+            _cleanup_ron_pending(room)
+
+    # 检查是否在等待副露响应
+    if hasattr(room, '_furo_pending') and sid in room._furo_pending:
+        del room._furo_pending[sid]
+        if not room._furo_pending:
+            # 所有人都pass → 下家摸牌
+            _cleanup_furo_pending(room)
+            last_idx = (room.current_turn_idx - 1) % 4 if room.current_turn_idx > 0 else 3
+            await _next_player_draw(room, room_name, None, last_idx)
+        return
+
+    # 否则：轮到下家摸牌
     last_discarder_idx = (room.current_turn_idx - 1) % 4 if room.current_turn_idx > 0 else 3
     await _next_player_draw(room, room_name, None, last_discarder_idx)
+
+
+@sio.event
+async def action_ron(sid, data):
+    """荣和确认"""
+    room_name = data.get('room_name')
+    room = room_manager.get_room(room_name)
+    if not room or not room.is_playing:
+        return
+
+    if not hasattr(room, '_ron_pending') or sid not in room._ron_pending:
+        await sio.emit('error', {'msg': 'Not eligible for ron'}, room=sid)
+        return
+
+    result = room._ron_pending[sid]
+    tile = getattr(room, '_ron_from_tile', '?')
+    from_sid = getattr(room, '_ron_from_sid', '')
+
+    await sio.emit('win_declared', {
+        'winner_sid': sid,
+        'from_sid': from_sid,
+        'is_tsumo': False,
+        'tile': tile,
+        'result': result,
+    }, room=room_name)
+    room.is_playing = False
+    _cleanup_ron_pending(room)
+    await _save_record(room, room_name, {
+        'type': 'ron',
+        'winner_sid': sid,
+        'from_sid': from_sid,
+        'tile': tile,
+        'result': result,
+    })
+
+
+@sio.event
+async def action_kakan(sid, data):
+    """加杠"""
+    room_name = data.get('room_name')
+    room = room_manager.get_room(room_name)
+    if not room:
+        return
+
+    hand_num = convert_hand_to_num(room.hands.get(sid, []))
+    furo_num = [convert_hand_to_num(m) for m in room.player_furo.get(sid, [])]
+    options = get_kakan_combinations(hand_num, furo_num)
+
+    if not options:
+        await sio.emit('error', {'msg': 'No kakan available'}, room=sid)
+        return
+
+    new_hand, new_furo, _ = options[0]
+    # 从手牌移除加杠的那张牌
+    # 找到被修改的那个刻子 → 加了第4张
+    for i, (old_m, new_m) in enumerate(zip(furo_num, new_furo)):
+        if len(old_m) != len(new_m) or len(new_m) == 4:
+            added_tile_num = [t for t in new_m if t not in old_m]
+            if added_tile_num:
+                tile_to_remove = added_tile_num[0]
+                # 转换回字符串并移除
+                hand = room.hands[sid]
+                for t_str in hand[:]:
+                    if convert_tile_to_num(t_str) == tile_to_remove:
+                        hand.remove(t_str)
+                        break
+            room.player_furo[sid][i] = room.player_furo[sid][i] + room.player_furo[sid][i][:1]
+            # 将刻子扩展为杠子（4张相同）
+            room.player_furo[sid][i] = [room.player_furo[sid][i][0]] * 4
+            break
+
+    # 检查抢杠
+    kakan_tile = room.player_furo[sid][-1][0] if room.player_furo[sid] else ""
+    if kakan_tile:
+        room.settings["robbing_a_kan"] = True
+        robbed = False
+        for other_sid in room.players:
+            if other_sid == sid or other_sid == "offline":
+                continue
+            result = room.check_win(other_sid, kakan_tile, is_tsumo=False)
+            if result:
+                await sio.emit('win_declared', {
+                    'winner_sid': other_sid,
+                    'from_sid': sid,
+                    'is_tsumo': False,
+                    'tile': kakan_tile,
+                    'result': result,
+                    'robbing_a_kan': True,
+                }, room=room_name)
+                room.is_playing = False
+                room.settings["robbing_a_kan"] = False
+                robbed = True
+                break
+        if robbed:
+            return
+        room.settings["robbing_a_kan"] = False
+
+    # 翻宝牌
+    room.flip_new_dora()
+    room.settings["after_a_kan"] = True
+
+    # 岭上摸牌
+    tile = room.draw_kan_tile(sid)
+    await sio.emit('kakan_declared', {
+        'sid': sid,
+        'seat': room.get_seat_index(sid),
+        'meld': room.player_furo[sid][-1],
+        'dora_indicators': room.dora_indicators,
+    }, room=room_name)
+
+    if tile:
+        await sio.emit('player_draw', {'tile': tile, 'seat': room.get_seat_index(sid)}, room=sid)
+        await sio.emit('player_draw_secret', {'user_idx': room.get_seat_index(sid)},
+                       room=room_name, skip_sid=sid)
+        # 检查岭上自摸
+        result = room.check_win(sid, tile, is_tsumo=True)
+        if result:
+            await sio.emit('win_declared', {
+                'winner_sid': sid,
+                'is_tsumo': True,
+                'tile': tile,
+                'result': result,
+                'after_a_kan': True,
+            }, room=room_name)
+            room.is_playing = False
+            return
+
+    room.current_turn_idx = room.get_seat_index(sid)
+    await sio.emit('your_turn', {'msg': 'Your turn after kakan', 'hand': room.hands[sid]}, room=sid)
 
 
 @sio.event
@@ -485,10 +638,8 @@ async def _handle_furo_response(sid, data, furo_type):
         return
 
     tile = data.get('tile')
-    # 从 furo prompt 的选项中选择（简化处理，实际应传入选项索引）
 
     if furo_type == 'pon':
-        # 碰：手中2张 + 场上1张
         hand = room.hands.get(sid, [])
         for _ in range(2):
             if tile in hand:
@@ -510,8 +661,13 @@ async def _handle_furo_response(sid, data, furo_type):
                 hand.remove(tile)
         meld = [tile, tile, tile, tile]
         room.player_furo[sid].append(meld)
-        # 杠后翻宝牌
         room.flip_new_dora()
+        room.settings["after_a_kan"] = True
+
+    # 清理 pending
+    if hasattr(room, '_furo_pending') and sid in room._furo_pending:
+        del room._furo_pending[sid]
+    _cleanup_furo_pending_if_empty(room)
 
     # 广播副露结果
     await sio.emit('furo_result', {
@@ -521,6 +677,23 @@ async def _handle_furo_response(sid, data, furo_type):
         'meld': room.player_furo[sid][-1],
         'dora_indicators': room.dora_indicators,
     }, room=room_name)
+
+    # 杠后岭上摸牌
+    if furo_type == 'daiminkan':
+        kan_tile = room.draw_kan_tile(sid)
+        if kan_tile:
+            await sio.emit('player_draw', {'tile': kan_tile, 'seat': room.get_seat_index(sid)}, room=sid)
+            result = room.check_win(sid, kan_tile, is_tsumo=True)
+            if result:
+                await sio.emit('win_declared', {
+                    'winner_sid': sid,
+                    'is_tsumo': True,
+                    'tile': kan_tile,
+                    'result': result,
+                    'after_a_kan': True,
+                }, room=room_name)
+                room.is_playing = False
+                return
 
     # 副露后该玩家出牌
     room.current_turn_idx = room.get_seat_index(sid)
@@ -543,7 +716,6 @@ async def _handle_ryuukyoku(room, room_name):
         else:
             noten_players.append(sid)
 
-    # 听牌者平分供托
     dealer_sid = room.players[room.dealer_idx]
     dealer_tenpai = dealer_sid in tenpai_players
 
@@ -554,7 +726,12 @@ async def _handle_ryuukyoku(room, room_name):
         'dealer_tenpai': dealer_tenpai,
     }, room=room_name)
 
-    # 局流转
+    await _save_record(room, room_name, {
+        'type': 'ryuukyoku',
+        'tenpai': [room.get_seat_index(s) for s in tenpai_players],
+        'noten': [room.get_seat_index(s) for s in noten_players],
+    })
+
     room.next_round(dealer_stays=dealer_tenpai)
 
     if room.is_game_over():
@@ -580,3 +757,44 @@ async def _handle_ryuukyoku(room, room_name):
                 'honba': room.settings['honba'],
                 'is_dealer': (i == room.dealer_idx),
             }, room=p_sid)
+
+
+# ── 清理函数 ──────────────────────────────────────────────
+
+def _cleanup_ron_pending(room):
+    if hasattr(room, '_ron_pending'):
+        del room._ron_pending
+    if hasattr(room, '_ron_from_tile'):
+        del room._ron_from_tile
+    if hasattr(room, '_ron_from_sid'):
+        del room._ron_from_sid
+
+
+def _cleanup_furo_pending(room):
+    if hasattr(room, '_furo_pending'):
+        del room._furo_pending
+
+
+def _cleanup_furo_pending_if_empty(room):
+    if hasattr(room, '_furo_pending') and not room._furo_pending:
+        del room._furo_pending
+
+
+# ── 牌谱持久化 ────────────────────────────────────────────
+
+async def _save_record(room, room_name, result_data):
+    """保存牌谱到数据库"""
+    try:
+        import json
+        async with AsyncSessionLocal() as db:
+            record = Record(
+                room_id=room.room_id,
+                turn_count=room.settings.get('round_number', 0),
+                replay_data=json.dumps(result_data, ensure_ascii=False),
+                result_data=json.dumps(result_data, ensure_ascii=False),
+            )
+            db.add(record)
+            await db.commit()
+            print(f"Record saved for room {room_name}")
+    except Exception as e:
+        print(f"Failed to save record: {e}")

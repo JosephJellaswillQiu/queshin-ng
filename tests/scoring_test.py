@@ -9,7 +9,7 @@ class TestScoring(unittest.TestCase):
         """1翻 闲家荣和 = 1000点"""
         result = calculate_score(han=1, is_dealer=False, is_tsumo=False)
         self.assertEqual(result["total"], 1000)
-        self.assertEqual(result["score_name"], "1翻")
+        self.assertEqual(result["score_name"], "1翻30符")
 
     def test_1han_dealer_ron(self):
         """1翻 庄家荣和 = 1500点 (1000*1.5=1500)"""
@@ -17,9 +17,9 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(result["total"], 1500)
 
     def test_2han_dealer_ron(self):
-        """2翻 庄家荣和 = 3000点 (2000*1.5)"""
+        """2翻 庄家荣和 = 2900点 (basic=30*16=480, dealer ron=ceil100(480*6)=2900)"""
         result = calculate_score(han=2, is_dealer=True, is_tsumo=False)
-        self.assertEqual(result["total"], 3000)
+        self.assertEqual(result["total"], 2900)
 
     def test_3han_non_dealer_ron(self):
         """3翻 闲家荣和 = 3900点"""
