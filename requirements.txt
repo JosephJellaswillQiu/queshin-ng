@@ -1,12 +1,25 @@
+# Web 框架
 fastapi==0.95.2
 uvicorn==0.21.1
+
+# 实时通信
+python-socketio>=5.8
+
+# 数据库
 sqlalchemy==2.0.10
-asyncmy==0.2.9
-pymysql==1.0.3
+aiosqlite>=0.18
+
+# 数据校验
+pydantic==1.10.7
+python-dotenv==1.0.0
+
+# 认证安全
 python-jose==3.3.0
 passlib==1.7.4
 bcrypt==4.0.1
 python-multipart==0.0.6
 email-validator==2.0.0
-pydantic==1.10.7
-python-dotenv==1.0.0
+
+# 以下仅旧版架构需要（当前不可用），可按需取消注释
+# asyncmy==0.2.9
+# pymysql==1.0.3
